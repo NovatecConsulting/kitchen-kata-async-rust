@@ -1,5 +1,8 @@
 use crate::food::{CookingStep, Food, COOKING_STEPS};
-use async_std::task;
+use async_std::{
+    sync::{channel, Receiver, Sender},
+    task,
+};
 use rand::Rng;
 use std::time::Duration;
 
@@ -30,6 +33,8 @@ impl Handler {
 pub struct Station {
     handler: Handler,
     handles_step: CookingStep,
+    pub input: (Sender<Food>, Receiver<Food>),
+    pub output: (Sender<Food>, Receiver<Food>),
 }
 
 impl Station {
@@ -40,6 +45,8 @@ impl Station {
         Self {
             handles_step,
             handler,
+            input: channel(1),
+            output: channel(1),
         }
     }
     pub fn all_stations() -> Vec<Self> {
@@ -55,25 +62,28 @@ impl Station {
             .map(|cooking_step| Self::with_handler(*cooking_step, handler))
             .collect()
     }
-    pub async fn prepare(&self, food: &mut Food) {
-        let step = food.cooking_steps.pop_front().unwrap();
-        if food.borked {
-            println!(
-                "This {} is {}, we can't be {} that!",
-                food.name,
-                food.conditions.last().unwrap(),
-                step
-            );
-        } else {
-            if let Err(e) = self.handler.handle(food, step).await {
+    pub async fn prepare(&self) {
+        while let Some(mut food) = self.input.1.recv().await {
+            let step = food.cooking_steps.pop_front().unwrap();
+            if food.borked {
                 println!(
-                    "Something went wrong while {} {}: [{}]",
-                    self.handles_step, food.name, e
+                    "This {} is {}, we can't be {} that!",
+                    food.name,
+                    food.conditions.last().unwrap(),
+                    step
                 );
-                food.add_mishap(self.handles_step);
             } else {
-                food.add_step_result(step);
+                if let Err(e) = self.handler.handle(&mut food, step).await {
+                    println!(
+                        "Something went wrong while {} {}: [{}]",
+                        self.handles_step, food.name, e
+                    );
+                    food.add_mishap(self.handles_step);
+                } else {
+                    food.add_step_result(step);
+                }
             }
+            self.output.0.send(food).await;
         }
     }
     pub fn can_prepare(&self, food: &Food) -> bool {

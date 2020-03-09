@@ -1,5 +1,8 @@
 use crate::{food::Food, handler::Station};
-use async_std::task;
+use async_std::{
+    sync::{channel, Arc},
+    task,
+};
 
 pub struct Kitchen {
     stations: Vec<Station>,
@@ -20,33 +23,58 @@ impl Kitchen {
     }
     pub fn run(&mut self) {
         task::block_on(async {
-            while !self.food_to_prepare.is_empty() {
-                self.find_more_work().await;
-            }
+            self.find_more_work().await;
         })
     }
-    async fn find_more_work(&mut self) {
-        let (done, todo) = self
-            .food_to_prepare
-            .drain(..)
-            .partition::<Vec<_>, _>(|food| food.cooking_steps.is_empty());
-        self.finished_meal.extend(done);
-        self.food_to_prepare = todo;
+    async fn find_more_work(self) {
+        let (to_station, from_station) = channel(self.food_to_prepare.len());
+        let finished_meals = channel(self.food_to_prepare.len());
+        let stations: Arc<Vec<_>> = Arc::new(self.stations.into_iter().map(Arc::new).collect());
 
-        for food in &mut self.food_to_prepare {
-            for station in &self.stations {
-                if station.can_prepare(food) {
-                    station.prepare(food).await;
-                    return;
+        task::spawn(async move {
+            let input = from_station.clone();
+            while let Some(food) = input.recv().await {
+                for station in &*stations.clone() {
+                    if station.can_prepare(&food) {
+                        station.input.0.send(food).await;
+                        break;
+                    }
                 }
             }
+        });
+
+        for station in &*stations.clone() {
+            let input = to_station.clone();
+            let finished_output = finished_meals.0.clone();
+            let station_output = station.output.1.clone();
+            task::spawn(async move {
+                while let Some(prepared_food) = station_output.recv().await {
+                    if prepared_food.cooking_steps.is_empty() {
+                        finished_output.send(prepared_food).await;
+                    } else {
+                        input.send(prepared_food).await;
+                    }
+                }
+            });
+            task::spawn(async move {
+                station.prepare();
+            });
         }
 
-        if !self.food_to_prepare.is_empty() {
-            println!("DEADLOCK DETECTED");
-            println!("SHUT IT DOWN");
-            panic!("Deadlock")
-        }
+        //         for food in self.food_to_prepare.drain(..) {
+        //             for station in &self.stations {
+        //                 if station.can_prepare(&food) {
+        //                     station.input.0.send(food).await;
+        //                     break;
+        //                 }
+        //             }
+        //         }
+        //
+        //         if !self.food_to_prepare.is_empty() {
+        //             println!("DEADLOCK DETECTED");
+        //             println!("SHUT IT DOWN");
+        //             panic!("Deadlock")
+        //         }
     }
 }
 #[cfg(test)]
