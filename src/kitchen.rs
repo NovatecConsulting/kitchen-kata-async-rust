@@ -1,4 +1,5 @@
 use crate::{food::Food, handler::Station};
+use async_std::task;
 
 pub struct Kitchen {
     stations: Vec<Station>,
@@ -18,11 +19,13 @@ impl Kitchen {
         }
     }
     pub fn run(&mut self) {
-        while !self.food_to_prepare.is_empty() {
-            self.find_more_work();
-        }
+        task::block_on(async {
+            while !self.food_to_prepare.is_empty() {
+                self.find_more_work().await;
+            }
+        })
     }
-    fn find_more_work(&mut self) {
+    async fn find_more_work(&mut self) {
         let (done, todo) = self
             .food_to_prepare
             .drain(..)
@@ -33,7 +36,7 @@ impl Kitchen {
         for food in &mut self.food_to_prepare {
             for station in &self.stations {
                 if station.can_prepare(food) {
-                    station.prepare(food);
+                    station.prepare(food).await;
                     return;
                 }
             }

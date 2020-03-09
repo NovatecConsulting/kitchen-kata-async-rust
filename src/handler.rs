@@ -1,6 +1,7 @@
 use crate::food::{CookingStep, Food, COOKING_STEPS};
+use async_std::task;
 use rand::Rng;
-use std::{thread, time::Duration};
+use std::time::Duration;
 
 #[derive(Clone, Copy)]
 pub struct Handler {
@@ -14,10 +15,10 @@ impl Handler {
     fn with_error_chance(error_chance: u8) -> Self {
         Handler { error_chance }
     }
-    fn handle(self, food: &mut Food, step: CookingStep) -> Result<(), &'static str> {
+    async fn handle(self, food: &mut Food, step: CookingStep) -> Result<(), &'static str> {
         println!("{} some {}", step, food.name);
         let mut rng = rand::thread_rng();
-        thread::sleep(Duration::from_secs(rng.gen_range(1, 4)));
+        task::sleep(Duration::from_secs(rng.gen_range(1, 4))).await;
         if rng.gen_range(0, 100) < self.error_chance {
             Err("Oops!")
         } else {
@@ -54,7 +55,7 @@ impl Station {
             .map(|cooking_step| Self::with_handler(*cooking_step, handler))
             .collect()
     }
-    pub fn prepare(&self, food: &mut Food) {
+    pub async fn prepare(&self, food: &mut Food) {
         let step = food.cooking_steps.pop_front().unwrap();
         if food.borked {
             println!(
@@ -64,7 +65,7 @@ impl Station {
                 step
             );
         } else {
-            if let Err(e) = self.handler.handle(food, step) {
+            if let Err(e) = self.handler.handle(food, step).await {
                 println!(
                     "Something went wrong while {} {}: [{}]",
                     self.handles_step, food.name, e
