@@ -1,10 +1,11 @@
 use crate::food::{CookingStep, Food, COOKING_STEPS};
 use async_std::{
-    sync::{channel, Receiver, Sender},
+    sync::{Receiver, Sender},
     task,
 };
 use rand::Rng;
 use std::time::Duration;
+use tracing::info;
 
 #[derive(Clone, Copy)]
 pub struct Handler {
@@ -19,10 +20,11 @@ impl Handler {
         Handler { error_chance }
     }
     async fn handle(self, food: &mut Food, step: CookingStep) -> Result<(), &'static str> {
-        println!("{} some {}", step, food.name);
-        let mut rng = rand::thread_rng();
-        task::sleep(Duration::from_secs(rng.gen_range(1, 4))).await;
-        if rng.gen_range(0, 100) < self.error_chance {
+        info!("{} some {}", step, food.name);
+        let sleep_duration = 2;
+        //rand::thread_rng().gen_range(1, 4);
+        task::sleep(Duration::from_secs(sleep_duration)).await;
+        if rand::thread_rng().gen_range(0, 100) < self.error_chance {
             Err("Oops!")
         } else {
             Ok(())
@@ -33,8 +35,6 @@ impl Handler {
 pub struct Station {
     handler: Handler,
     handles_step: CookingStep,
-    pub input: (Sender<Food>, Receiver<Food>),
-    pub output: (Sender<Food>, Receiver<Food>),
 }
 
 impl Station {
@@ -45,8 +45,6 @@ impl Station {
         Self {
             handles_step,
             handler,
-            input: channel(1),
-            output: channel(1),
         }
     }
     pub fn all_stations() -> Vec<Self> {
@@ -62,8 +60,8 @@ impl Station {
             .map(|cooking_step| Self::with_handler(*cooking_step, handler))
             .collect()
     }
-    pub async fn prepare(&self) {
-        while let Some(mut food) = self.input.1.recv().await {
+    pub async fn prepare(&self, food_to_prepare: Receiver<Food>, prepared_food: Sender<Food>) {
+        while let Some(mut food) = food_to_prepare.recv().await {
             let step = food.cooking_steps.pop_front().unwrap();
             if food.borked {
                 println!(
@@ -72,18 +70,17 @@ impl Station {
                     food.conditions.last().unwrap(),
                     step
                 );
+            } else if let Err(e) = self.handler.handle(&mut food, step).await {
+                println!(
+                    "Something went wrong while {} {}: [{}]",
+                    self.handles_step, food.name, e
+                );
+                food.add_mishap(self.handles_step);
             } else {
-                if let Err(e) = self.handler.handle(&mut food, step).await {
-                    println!(
-                        "Something went wrong while {} {}: [{}]",
-                        self.handles_step, food.name, e
-                    );
-                    food.add_mishap(self.handles_step);
-                } else {
-                    food.add_step_result(step);
-                }
+                food.add_step_result(step);
             }
-            self.output.0.send(food).await;
+
+            prepared_food.send(food).await;
         }
     }
     pub fn can_prepare(&self, food: &Food) -> bool {

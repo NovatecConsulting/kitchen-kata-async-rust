@@ -1,5 +1,4 @@
-use std::collections::VecDeque;
-use std::{fmt, fmt::Display};
+use std::{collections::VecDeque, fmt, fmt::Display};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum CookingStep {

@@ -22,68 +22,91 @@ impl Kitchen {
         }
     }
     pub fn run(&mut self) {
-        task::block_on(async {
-            self.find_more_work().await;
-        })
+        task::block_on(self.find_more_work())
     }
-    async fn find_more_work(self) {
-        let (to_station, from_station) = channel(self.food_to_prepare.len());
-        let finished_meals = channel(self.food_to_prepare.len());
-        let stations: Arc<Vec<_>> = Arc::new(self.stations.into_iter().map(Arc::new).collect());
+    async fn find_more_work(&mut self) {
+        let food_amount = self.food_to_prepare.len();
+        let (send_to_prepare, recv_to_prepare) = channel(food_amount);
+        let (send_done, recv_done) = channel(1);
+
+        let mut station_handles = vec![];
+        for station in self.stations.drain(..) {
+            let station = Arc::new(station);
+            let send_done = send_done.clone();
+            let handling_station = station.clone();
+            let (send_in, recv_in) = channel(1);
+            let (send_out, recv_out) = channel(1);
+            task::spawn(async move { handling_station.prepare(recv_in, send_out).await });
+            task::spawn(async move {
+                while let Some(done_food) = recv_out.recv().await {
+                    send_done.send(done_food).await;
+                }
+            });
+            station_handles.push((send_in, station.clone()));
+        }
 
         task::spawn(async move {
-            let input = from_station.clone();
-            while let Some(food) = input.recv().await {
-                for station in &*stations.clone() {
-                    if station.can_prepare(&food) {
-                        station.input.0.send(food).await;
+            while let Some(food_to_prepare) = recv_to_prepare.recv().await {
+                for (station_input, station) in &station_handles {
+                    let can_prepare = station.can_prepare(&food_to_prepare);
+                    if can_prepare {
+                        let station_input = station_input.clone();
+                        task::spawn(async move {
+                            station_input.send(food_to_prepare).await;
+                        });
                         break;
                     }
                 }
             }
         });
 
-        for station in &*stations.clone() {
-            let input = to_station.clone();
-            let finished_output = finished_meals.0.clone();
-            let station_output = station.output.1.clone();
-            task::spawn(async move {
-                while let Some(prepared_food) = station_output.recv().await {
-                    if prepared_food.cooking_steps.is_empty() {
-                        finished_output.send(prepared_food).await;
-                    } else {
-                        input.send(prepared_food).await;
-                    }
-                }
-            });
-            task::spawn(async move {
-                station.prepare();
-            });
+        for food_to_prepare in self.food_to_prepare.drain(..) {
+            send_to_prepare.send(food_to_prepare).await;
         }
 
-        //         for food in self.food_to_prepare.drain(..) {
-        //             for station in &self.stations {
-        //                 if station.can_prepare(&food) {
-        //                     station.input.0.send(food).await;
-        //                     break;
-        //                 }
-        //             }
-        //         }
-        //
-        //         if !self.food_to_prepare.is_empty() {
-        //             println!("DEADLOCK DETECTED");
-        //             println!("SHUT IT DOWN");
-        //             panic!("Deadlock")
-        //         }
+        let (send_finished, recv_finished) = channel(1);
+
+        task::spawn(async move {
+            while let Some(done_food) = recv_done.recv().await {
+                if done_food.cooking_steps.is_empty() {
+                    send_finished.send(done_food).await;
+                } else {
+                    send_to_prepare.send(done_food).await;
+                }
+            }
+        });
+
+        while let Some(finished_food) = recv_finished.recv().await {
+            self.finished_meal.push(finished_food);
+            if self.finished_meal.len() == food_amount {
+                break;
+            }
+        }
     }
 }
+
 #[cfg(test)]
 mod test {
     use super::*;
     use crate::{food::CookingStep, handler::Handler};
+    use tracing::Level;
+    use tracing_subscriber::FmtSubscriber;
+
+    fn init_tracing() {
+        // a builder for `FmtSubscriber`.
+        let subscriber = FmtSubscriber::builder()
+            // all spans/events with a level higher than TRACE (e.g, debug, info, warn, etc.)
+            // will be written to stdout.
+            .with_max_level(Level::TRACE)
+            // completes the builder.
+            .finish();
+
+        let _ = tracing::subscriber::set_global_default(subscriber);
+    }
 
     #[test]
     fn food_is_cooked_correctly() {
+        init_tracing();
         let mut kitchen = Kitchen::with_stations(
             vec![potatoes(), steak(), cheese(), fruit_cake()],
             Station::all_stations_with_handler(PERFECT_HANDLER),
@@ -99,6 +122,7 @@ mod test {
 
     #[test]
     fn burned_potatoes() {
+        init_tracing();
         let mut kitchen = Kitchen::with_stations(
             vec![potatoes()],
             vec![
@@ -119,6 +143,7 @@ mod test {
 
     #[test]
     fn steak_fails_and_potatoes_succeed() {
+        init_tracing();
         let mut kitchen = Kitchen::with_stations(
             vec![potatoes(), steak()],
             vec![
