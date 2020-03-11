@@ -1,6 +1,6 @@
 use crate::food::{CookingStep, Food, COOKING_STEPS};
 use async_std::{
-    sync::{Receiver, Sender},
+    sync::{channel, Receiver, Sender},
     task,
 };
 use rand::Rng;
@@ -35,6 +35,8 @@ impl Handler {
 pub struct Station {
     handler: Handler,
     handles_step: CookingStep,
+    input: (Sender<Food>, Receiver<Food>),
+    output: (Sender<Food>, Receiver<Food>),
 }
 
 impl Station {
@@ -45,7 +47,15 @@ impl Station {
         Self {
             handles_step,
             handler,
+            input: channel(1),
+            output: channel(1),
         }
+    }
+    pub fn input(&self) -> Sender<Food> {
+        self.input.0.clone()
+    }
+    pub fn output(&self) -> Receiver<Food> {
+        self.output.1.clone()
     }
     pub fn all_stations() -> Vec<Self> {
         COOKING_STEPS
@@ -60,8 +70,8 @@ impl Station {
             .map(|cooking_step| Self::with_handler(*cooking_step, handler))
             .collect()
     }
-    pub async fn prepare(&self, food_to_prepare: Receiver<Food>, prepared_food: Sender<Food>) {
-        while let Some(mut food) = food_to_prepare.recv().await {
+    pub async fn prepare(&self) {
+        while let Some(mut food) = self.input.1.recv().await {
             let step = food.cooking_steps.pop_front().unwrap();
             if food.borked {
                 println!(
@@ -80,7 +90,7 @@ impl Station {
                 food.add_step_result(step);
             }
 
-            prepared_food.send(food).await;
+            self.output.0.send(food).await;
         }
     }
     pub fn can_prepare(&self, food: &Food) -> bool {

@@ -34,23 +34,20 @@ impl Kitchen {
             let station = Arc::new(station);
             let send_done = send_done.clone();
             let handling_station = station.clone();
-            let (send_in, recv_in) = channel(1);
-            let (send_out, recv_out) = channel(1);
-            task::spawn(async move { handling_station.prepare(recv_in, send_out).await });
+            station_handles.push(station.clone());
+            task::spawn(async move { handling_station.prepare().await });
             task::spawn(async move {
-                while let Some(done_food) = recv_out.recv().await {
+                while let Some(done_food) = station.output().recv().await {
                     send_done.send(done_food).await;
                 }
             });
-            station_handles.push((send_in, station.clone()));
         }
 
         task::spawn(async move {
             while let Some(food_to_prepare) = recv_to_prepare.recv().await {
-                for (station_input, station) in &station_handles {
-                    let can_prepare = station.can_prepare(&food_to_prepare);
-                    if can_prepare {
-                        let station_input = station_input.clone();
+                for station in &station_handles {
+                    if station.can_prepare(&food_to_prepare) {
+                        let station_input = station.input();
                         task::spawn(async move {
                             station_input.send(food_to_prepare).await;
                         });
