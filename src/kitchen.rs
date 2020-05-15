@@ -1,8 +1,7 @@
 use crate::{food::Food, handler::Station};
-use async_std::{
-    sync::{channel, Arc},
-    task,
-};
+use futures::{future::select_all, FutureExt};
+use smol::Task;
+use std::rc::Rc;
 
 pub struct Kitchen {
     stations: Vec<Station>,
@@ -22,48 +21,42 @@ impl Kitchen {
         }
     }
     pub fn run(&mut self) {
-        task::block_on(self.find_more_work())
+        smol::run(self.find_more_work())
     }
     async fn find_more_work(&mut self) {
         let food_amount = self.food_to_prepare.len();
-        let (send_to_prepare, recv_to_prepare) = channel(food_amount);
-        let (send_done, recv_done) = channel(1);
+        let (send_to_prepare, recv_to_prepare) = piper::chan(food_amount);
+        let (send_done, recv_done) = piper::chan(1);
 
         let mut station_handles = vec![];
-        for station in self.stations.drain(..) {
-            let station = Arc::new(station);
-            let send_done = send_done.clone();
-            let handling_station = station.clone();
-            station_handles.push(station.clone());
-            task::spawn(async move { handling_station.prepare().await });
-            task::spawn(async move {
-                while let Some(done_food) = station.output().recv().await {
-                    send_done.send(done_food).await;
-                }
-            });
-        }
 
-        task::spawn(async move {
+        let mut station_futs = select_all(self.stations.drain(..).into_iter().map(|station| {
+            let station = Rc::new(station);
+            let send_done = send_done.clone();
+            station_handles.push(station.clone());
+            Task::local(async move { station.prepare(send_done).await })
+        }))
+        .fuse();
+
+        let mut station_feeder = Task::local(async move {
             while let Some(food_to_prepare) = recv_to_prepare.recv().await {
-                for station in &station_handles {
-                    if station.can_prepare(&food_to_prepare) {
-                        let station_input = station.input();
-                        task::spawn(async move {
-                            station_input.send(food_to_prepare).await;
-                        });
-                        break;
-                    }
+                if let Some(station) = station_handles
+                    .iter()
+                    .find(|it| it.can_prepare(&food_to_prepare))
+                {
+                    station.send(food_to_prepare).await;
                 }
             }
-        });
+        })
+        .fuse();
 
         for food_to_prepare in self.food_to_prepare.drain(..) {
             send_to_prepare.send(food_to_prepare).await;
         }
 
-        let (send_finished, recv_finished) = channel(1);
+        let (send_finished, recv_finished) = piper::chan(1);
 
-        task::spawn(async move {
+        let mut output_distributor = Task::local(async move {
             while let Some(done_food) = recv_done.recv().await {
                 if done_food.cooking_steps.is_empty() {
                     send_finished.send(done_food).await;
@@ -71,7 +64,14 @@ impl Kitchen {
                     send_to_prepare.send(done_food).await;
                 }
             }
-        });
+        })
+        .fuse();
+
+        futures::select!(
+            _ = station_futs => (),
+            _ = station_feeder => (),
+            _ = output_distributor => ()
+        );
 
         while let Some(finished_food) = recv_finished.recv().await {
             self.finished_meal.push(finished_food);
