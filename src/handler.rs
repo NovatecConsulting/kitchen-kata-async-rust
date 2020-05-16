@@ -1,12 +1,14 @@
 use crate::food::{CookingStep, Food, COOKING_STEPS};
 use anyhow::Result;
-use piper::{Receiver, Sender};
 use rand::Rng;
 use smol::Timer;
-use std::time::Duration;
+use std::{
+    fmt::{self, Debug},
+    time::Duration,
+};
 use tracing::{info, warn};
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct Handler {
     pub error_chance: u8,
 }
@@ -18,7 +20,7 @@ impl Handler {
     fn with_error_chance(error_chance: u8) -> Self {
         Handler { error_chance }
     }
-    async fn handle(self, food: &mut Food, step: CookingStep) -> Result<(), &'static str> {
+    async fn handle(&mut self, food: &mut Food, step: CookingStep) -> Result<(), &'static str> {
         info!("{} some {}", step, food.name);
         //rand::thread_rng().gen_range(1, 4);
         let sleep_duration = Duration::from_secs(1);
@@ -34,7 +36,16 @@ impl Handler {
 pub struct Station {
     handler: Handler,
     handles_step: CookingStep,
-    input: (Sender<Food>, Receiver<Food>),
+}
+
+impl fmt::Display for Station {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} Station ({}% failure)",
+            self.handles_step, self.handler.error_chance
+        )
+    }
 }
 
 impl Station {
@@ -45,11 +56,7 @@ impl Station {
         Self {
             handles_step,
             handler,
-            input: piper::chan(1),
         }
-    }
-    pub async fn send(&self, food: Food) {
-        self.input.0.clone().send(food).await
     }
     pub fn all_stations() -> Vec<Self> {
         COOKING_STEPS
@@ -64,28 +71,25 @@ impl Station {
             .map(|cooking_step| Self::with_handler(*cooking_step, handler))
             .collect()
     }
-    pub async fn prepare(&self, send_out: Sender<Food>) {
-        while let Some(mut food) = self.input.1.recv().await {
-            let step = food.cooking_steps.pop_front().unwrap();
-            if food.borked {
-                warn!(
-                    "This {} is {}, we can't be {} that!",
-                    food.name,
-                    food.conditions.last().unwrap(),
-                    step
-                );
-            } else if let Err(e) = self.handler.handle(&mut food, step).await {
-                warn!(
-                    "Something went wrong while {} {}: [{}]",
-                    self.handles_step, food.name, e
-                );
-                food.add_mishap(self.handles_step);
-            } else {
-                food.add_step_result(step);
-            }
-
-            send_out.send(food).await;
+    pub async fn prepare(&mut self, mut food: Food) -> Food {
+        let step = food.cooking_steps.pop_front().unwrap();
+        if food.borked {
+            warn!(
+                "This {} is {}, we can't be {} that!",
+                food.name,
+                food.conditions.last().unwrap(),
+                step
+            );
+        } else if let Err(e) = self.handler.handle(&mut food, step).await {
+            warn!(
+                "Something went wrong while {} {}: [{}]",
+                self.handles_step, food.name, e
+            );
+            food.add_mishap(self.handles_step);
+        } else {
+            food.add_step_result(step);
         }
+        food
     }
     pub fn can_prepare(&self, food: &Food) -> bool {
         food.cooking_steps.get(0) == Some(&self.handles_step)

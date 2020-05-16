@@ -68,6 +68,9 @@ impl Food {
             CookingStep::Peel => "blood-covered",
         });
     }
+    pub fn has_steps_left(&self) -> bool {
+        !self.cooking_steps.is_empty()
+    }
 }
 
 impl Display for Food {

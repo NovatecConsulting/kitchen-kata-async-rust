@@ -1,12 +1,38 @@
 use crate::{food::Food, handler::Station};
-use futures::{future::select_all, FutureExt};
+use futures::{stream::FuturesUnordered, StreamExt};
 use smol::Task;
-use std::rc::Rc;
+use std::fmt;
+use tracing::debug;
 
 pub struct Kitchen {
     stations: Vec<Station>,
     food_to_prepare: Vec<Food>,
     finished_meal: Vec<Food>,
+}
+
+fn show_vec(v: &Vec<impl fmt::Display>) -> String {
+    format!(
+        "[{}]",
+        v.iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
+impl fmt::Debug for Kitchen {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut builder = f.debug_struct("Kitchen");
+        builder.field("stations", &show_vec(&self.stations));
+        if !self.food_to_prepare.is_empty() {
+            builder.field("food_to_prepare", &show_vec(&self.food_to_prepare));
+        }
+
+        if !self.finished_meal.is_empty() {
+            builder.field("finished_meal", &show_vec(&self.finished_meal));
+        }
+        builder.finish()
+    }
 }
 
 impl Kitchen {
@@ -24,61 +50,58 @@ impl Kitchen {
         smol::run(self.find_more_work())
     }
     async fn find_more_work(&mut self) {
-        let food_amount = self.food_to_prepare.len();
-        let (send_to_prepare, recv_to_prepare) = piper::chan(food_amount);
-        let (send_done, recv_done) = piper::chan(1);
-
-        let mut station_handles = vec![];
-
-        let mut station_futs = select_all(self.stations.drain(..).into_iter().map(|station| {
-            let station = Rc::new(station);
-            let send_done = send_done.clone();
-            station_handles.push(station.clone());
-            Task::local(async move { station.prepare(send_done).await })
-        }))
-        .fuse();
-
-        let mut station_feeder = Task::local(async move {
-            while let Some(food_to_prepare) = recv_to_prepare.recv().await {
-                if let Some(station) = station_handles
-                    .iter()
-                    .find(|it| it.can_prepare(&food_to_prepare))
-                {
-                    station.send(food_to_prepare).await;
+        debug!("Starting kitchen: {:?}", self);
+        let mut working_stations = FuturesUnordered::new();
+        let mut stations: Vec<_> = self.stations.drain(..).collect();
+        let mut food_to_prepare: Vec<Food> = self.food_to_prepare.drain(..).collect();
+        while !food_to_prepare.is_empty() || !working_stations.is_empty() {
+            let mut unassignable_food = Vec::new();
+            let mut idle_stations = Vec::new();
+            'food: loop {
+                debug!(
+                    "Putting {} back in {}",
+                    show_vec(&idle_stations),
+                    show_vec(&stations)
+                );
+                stations.extend(idle_stations.drain(..));
+                match food_to_prepare.pop() {
+                    None => break,
+                    Some(food) => {
+                        debug!("Attempting to handle {} with {}", food, show_vec(&stations));
+                        while let Some(mut station) = stations.pop() {
+                            if station.can_prepare(&food) {
+                                debug!("Sending {} to {}", food, station);
+                                working_stations.push(Task::spawn(async move {
+                                    let food = station.prepare(food).await;
+                                    (food, station)
+                                }));
+                                continue 'food;
+                            } else {
+                                idle_stations.push(station);
+                            }
+                        }
+                        debug!(
+                            "Couldn't handle {} right now, no free station for {:?}",
+                            food,
+                            food.cooking_steps.front()
+                        );
+                        unassignable_food.push(food);
+                    }
                 }
             }
-        })
-        .fuse();
-
-        for food_to_prepare in self.food_to_prepare.drain(..) {
-            send_to_prepare.send(food_to_prepare).await;
-        }
-
-        let (send_finished, recv_finished) = piper::chan(1);
-
-        let mut output_distributor = Task::local(async move {
-            while let Some(done_food) = recv_done.recv().await {
-                if done_food.cooking_steps.is_empty() {
-                    send_finished.send(done_food).await;
+            food_to_prepare.extend(unassignable_food.drain(..));
+            if let Some((food, station)) = working_stations.next().await {
+                stations.push(station);
+                if food.has_steps_left() {
+                    debug!("Queueing {} again", food);
+                    food_to_prepare.push(food);
                 } else {
-                    send_to_prepare.send(done_food).await;
+                    debug!("Completed {}", food);
+                    self.finished_meal.push(food);
                 }
             }
-        })
-        .fuse();
-
-        futures::select!(
-            _ = station_futs => (),
-            _ = station_feeder => (),
-            _ = output_distributor => ()
-        );
-
-        while let Some(finished_food) = recv_finished.recv().await {
-            self.finished_meal.push(finished_food);
-            if self.finished_meal.len() == food_amount {
-                break;
-            }
         }
+        self.stations.extend(stations.drain(..));
     }
 }
 
@@ -94,7 +117,7 @@ mod test {
         let subscriber = FmtSubscriber::builder()
             // all spans/events with a level higher than TRACE (e.g, debug, info, warn, etc.)
             // will be written to stdout.
-            .with_max_level(Level::TRACE)
+            .with_max_level(Level::INFO)
             // completes the builder.
             .finish();
 
@@ -110,6 +133,7 @@ mod test {
         );
         kitchen.run();
 
+        debug!("Kitchen after run: {:?}", kitchen);
         assert_eq!(kitchen.finished_meal.len(), 4);
 
         for finished_meal in &kitchen.finished_meal {
